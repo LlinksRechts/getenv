@@ -16,4 +16,9 @@ jobs:
           
     - name: Build
       run: make
-      
+
+    - name: Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: getenv
+        path: getenv

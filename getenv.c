@@ -16,6 +16,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* #define DEBUG */
+
 // number of bytes in a JMP/CALL rel32 instruction
 #define REL32_SZ 5
 
@@ -54,7 +56,7 @@ void *find_library(pid_t pid, const char *libname) {
 int poke_text(pid_t pid, void *where, void *new_text, void *old_text,
               size_t len) {
   if (len % sizeof(void *) != 0) {
-    printf("invalid len, not a multiple of %zd\n", sizeof(void *));
+    fprintf(stderr, "invalid len, not a multiple of %zd\n", sizeof(void *));
     return -1;
   }
 
@@ -88,10 +90,10 @@ int do_wait(const char *name) {
     if (WSTOPSIG(status) == SIGTRAP) {
       return 0;
     }
-    printf("%s unexpectedly got status %s\n", name, strsignal(status));
+    fprintf(stderr, "%s unexpectedly got status %s\n", name, strsignal(status));
     return -1;
   }
-  printf("%s got unexpected status %d\n", name, status);
+  fprintf(stderr, "%s got unexpected status %d\n", name, status);
   return -1;
 
 }
@@ -112,13 +114,13 @@ void check_yama(void) {
   char yama_buf[8];
   memset(yama_buf, 0, sizeof(yama_buf));
   if (fread(yama_buf, 1, sizeof(yama_buf), yama_file) == 0) {
-      printf("Could not read yama file\n");
+      fprintf(stderr, "Could not read yama file\n");
   }
   if (strcmp(yama_buf, "0\n") != 0) {
-    printf("\nThe likely cause of this failure is that your system has "
+    fprintf(stderr, "\nThe likely cause of this failure is that your system has "
            "kernel.yama.ptrace_scope = %s",
            yama_buf);
-    printf("If you would like to disable Yama, you can run: "
+    fprintf(stderr, "If you would like to disable Yama, you can run: "
            "sudo sysctl kernel.yama.ptrace_scope=0\n");
   }
   fclose(yama_file);
@@ -127,7 +129,7 @@ void check_yama(void) {
 int32_t compute_jmp(void *from, void *to) {
   int64_t delta = (int64_t)to - (int64_t)from - REL32_SZ;
   if (delta < INT_MIN || delta > INT_MAX) {
-    printf("cannot do relative jump of size %li; did you compile with -fPIC?\n",
+    fprintf(stderr, "cannot do relative jump of size %li; did you compile with -fPIC?\n",
            delta);
     exit(1);
   }
@@ -156,7 +158,9 @@ int getenv_process(pid_t pid, char* env) {
     return -1;
   }
   void *rip = (void *)oldregs.rip;
-  /* printf("their %%rip           %p\n", rip); */
+  #ifdef DEBUG
+  fprintf(stderr, "their %%rip           %p\n", rip);
+  #endif
 
   // First, we are going to allocate some memory for ourselves so we don't
   // need
@@ -205,12 +209,14 @@ int getenv_process(pid_t pid, char* env) {
   // this is the address of the memory we allocated
   void *mmap_memory = (void *)newregs.rax;
   if (mmap_memory == (void *)-1) {
-    printf("failed to mmap\n");
+    fprintf(stderr, "failed to mmap\n");
     goto fail;
   }
-  /* printf("allocated memory at  %p\n", mmap_memory); */
+  #ifdef DEBUG
+  fprintf(stderr, "allocated memory at  %p\n", mmap_memory);
 
-  /* printf("executing jump to mmap region\n"); */
+  fprintf(stderr, "executing jump to mmap region\n");
+  #endif
   if (singlestep(pid)) {
     goto fail;
   }
@@ -220,9 +226,11 @@ int getenv_process(pid_t pid, char* env) {
     goto fail;
   }
   if (newregs.rip == (long)mmap_memory) {
-    /* printf("successfully jumped to mmap area\n"); */
+    #ifdef DEBUG
+    fprintf(stderr, "successfully jumped to mmap area\n");
+    #endif
   } else {
-    printf("unexpectedly jumped to %p\n", (void *)newregs.rip);
+    fprintf(stderr, "unexpectedly jumped to %p\n", (void *)newregs.rip);
     goto fail;
   }
 
@@ -248,9 +256,11 @@ int getenv_process(pid_t pid, char* env) {
   void *our_libc = find_library(getpid(), libc_string);
   void *their_getenv = their_libc + ((void *)getenv - our_libc);
   /* FILE *their_stderr = their_libc + ((void *)stderr - our_libc); */
-  /* printf("their libc           %p\n", their_libc); */
-  /* printf("their getenv        %p\n", their_getenv); */
-  /* printf("their stderr         %p\n", their_stderr); */
+  #ifdef DEBUG
+  fprintf(stderr, "their libc           %p\n", their_libc);
+  fprintf(stderr, "their getenv        %p\n", their_getenv);
+  /* fprintf(stderr, "their stderr         %p\n", their_stderr); */
+  #endif
 
   // We want to make a call like:
   //
@@ -263,17 +273,17 @@ int getenv_process(pid_t pid, char* env) {
   //   * put the format string right after the TRAP
   //   * use the TRAP to restore the original text/program state
 
+  size_t memsize = strlen(env) + 6;
+  size_t blocksize = 32;
+  while (blocksize < memsize) blocksize <<= 1;
+
   // memory we are going to copy into our mmap area
-  uint8_t new_text[64];
-  memset(new_text, 0, sizeof(new_text));
+  uint8_t *new_text = calloc(blocksize, sizeof(uint8_t));
 
   // insert a CALL instruction
   size_t offset = 0;
-  /* new_text[offset++] = 0xeb; */
-  /* new_text[offset++] = 0xfe; */
   new_text[offset++] = 0xe8; // CALL rel32
   int32_t getenv_delta = compute_jmp(mmap_memory, their_getenv);
-  /* printf("Jumping to %lx (%lx)\n", -(int64_t) getenv_delta, (int64_t) mmap_memory); */
   memmove(new_text + offset, &getenv_delta, sizeof(getenv_delta));
   offset += sizeof(getenv_delta);
 
@@ -284,10 +294,13 @@ int getenv_process(pid_t pid, char* env) {
   memmove(new_text + offset, env, strlen(env));
 
   // update the mmap area
-  /* printf("inserting code/data into the mmap area at %p\n", mmap_memory); */
-  if (poke_text(pid, mmap_memory, new_text, NULL, sizeof(new_text))) {
+  #ifdef DEBUG
+  fprintf(stderr, "inserting code/data into the mmap area at %p\n", mmap_memory);
+  #endif
+  if (poke_text(pid, mmap_memory, new_text, NULL, blocksize)) {
     goto fail;
   }
+  free(new_text);
 
   if (poke_text(pid, rip, new_word, NULL, sizeof(new_word))) {
     goto fail;
@@ -300,14 +313,18 @@ int getenv_process(pid_t pid, char* env) {
   newregs.rdi = (long)mmap_memory + offset; // pointer to the format string
   /* newregs.rdx = oldregs.rip;                // the integer we want to print */
 
-  /* printf("setting the registers of the remote process\n"); */
+  #ifdef DEBUG
+  fprintf(stderr, "setting the registers of the remote process\n");
+  #endif
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
     perror("PTRACE_SETREGS");
     goto fail;
   }
 
   // continue the program, and wait for the trap
-  /* printf("continuing execution\n"); */
+  #ifdef DEBUG
+  fprintf(stderr, "continuing execution\n");
+  #endif
   ptrace(PTRACE_CONT, pid, NULL, NULL);
   if (do_wait("PTRACE_CONT")) {
     goto fail;
@@ -348,7 +365,9 @@ int getenv_process(pid_t pid, char* env) {
   new_word[1] = 0xe0; // JMP %rax
   poke_text(pid, (void *)newregs.rip, new_word, NULL, sizeof(new_word));
 
-  /* printf("jumping back to original rip\n"); */
+  #ifdef DEBUG
+  fprintf(stderr, "jumping back to original rip\n");
+  #endif
   if (singlestep(pid)) {
     goto fail;
   }
@@ -358,9 +377,11 @@ int getenv_process(pid_t pid, char* env) {
   }
 
   if (newregs.rip == (long)rip) {
-    /* printf("successfully jumped back to original %%rip at %p\n", rip); */
+    #ifdef DEBUG
+    fprintf(stderr, "successfully jumped back to original %%rip at %p\n", rip);
+    #endif
   } else {
-    printf("unexpectedly jumped to %p (expected to be at %p)\n",
+    fprintf(stderr, "unexpectedly jumped to %p (expected to be at %p)\n",
            (void *)newregs.rip, rip);
     goto fail;
   }
@@ -375,7 +396,9 @@ int getenv_process(pid_t pid, char* env) {
   }
 
   // make the system call
-  /* printf("making call to mmap\n"); */
+  #ifdef DEBUG
+  fprintf(stderr, "making call to mmap\n");
+  #endif
   if (singlestep(pid)) {
     goto fail;
   }
@@ -383,19 +406,25 @@ int getenv_process(pid_t pid, char* env) {
     perror("PTRACE_GETREGS");
     goto fail;
   }
-  /* printf("munmap returned with status %llu\n", newregs.rax); */
+  #ifdef DEBUG
+  fprintf(stderr, "munmap returned with status %llu\n", newregs.rax);
 
-  /* printf("restoring old text at %p\n", rip); */
+  fprintf(stderr, "restoring old text at %p\n", rip);
+  #endif
   poke_text(pid, rip, old_word, NULL, sizeof(old_word));
 
-  /* printf("restoring old registers\n"); */
+  #ifdef DEBUG
+  fprintf(stderr, "restoring old registers\n");
+  #endif
   if (ptrace(PTRACE_SETREGS, pid, NULL, &oldregs)) {
     perror("PTRACE_SETREGS");
     goto fail;
   }
 
   // detach the process
-  /* printf("detaching\n"); */
+  #ifdef DEBUG
+  fprintf(stderr, "detaching\n");
+  #endif
   if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
     perror("PTRACE_DETACH");
     goto fail;
@@ -418,7 +447,7 @@ int main(int argc, char **argv) {
   while ((c = getopt(argc, argv, "hp:e:")) != -1) {
     switch (c) {
     case 'h':
-      printf("Usage: %s -p <pid>\n", argv[0]);
+      fprintf(stderr, "Usage: %s -p <pid>\n", argv[0]);
       return 0;
       break;
     case 'p':
